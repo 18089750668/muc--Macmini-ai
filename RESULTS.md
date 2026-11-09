@@ -1,6 +1,7 @@
 # 實測結果（M0 / M1 / M2 / 傳輸升級）
 
 機器：MacBook Air M1（16GB）、macOS 27.2、MLX（arm64 venv, Python 3.9）
+目標機型（部署與成本計算的基準）：**Mac mini M4 / 32GB 統一內存 / 512GB SSD / 120GB/s 帶寬 / 3 × Thunderbolt 4 / ¥8,999**（詳見 README「硬體基線」）
 模型：ToyModel 8 層 / hidden 256 / 4 heads / vocab 512（隨機權重，同一 seed 各進程一致）
 
 > env 的坑：`/usr/local/bin/python3` 是 **x86_64（Rosetta）**，MLX 沒有 x86 wheel，必須用 `/usr/bin/python3`（arm64 native）建 venv。

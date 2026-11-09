@@ -84,11 +84,48 @@ PYTHONPATH=. .venv-arm/bin/python bench/serve_fault.py --mode spec --tokens 96 -
 殘留進程一律用 `lsof -nP -iTCP:<port> -sTCP:LISTEN -t | xargs kill -9` 清掉——
 **殘留端口是本項目最陰的失敗模式：連到舊分片，形狀全合法，只是輸出錯 token。**
 
+## 硬體基線：「一台 Mac mini」具體是哪一台
+
+本項目大部分的數字都是這一台上量出來的，不是泛指「隨便一台小主機」。
+
+| 項目 | 規格 |
+|---|---|
+| 機型 | **Mac mini（M4，2024 年 10 月發布）** |
+| 芯片 | **Apple M4**：10 核 CPU（4 性能核 + 6 能效核）、10 核 GPU、16 核神經網絡引擎 |
+| 統一內存 | **32GB**（M4 機型可選 16 / 24 / 32GB，M4 最高就是 32GB） |
+| 內存帶寬 | **120 GB/s**（這一點直接決定 decode 速度上限：每 token 要把權重讀一遍） |
+| 硬盤 | **512GB SSD**（可選 256GB / 1TB / 2TB） |
+| 內建 GPU 顯存 | 與統一內存同一塊，沒有獨立顯存——所以「32GB 運存」就是它能給模型的全部 |
+| 雷電 | 背面 **3 × Thunderbolt 4（40Gb/s）**；正面 2 × USB-C（10Gb/s）+ 3.5mm 耳機孔；另有 HDMI + 千兆網（可選 10Gb） |
+| 體積重量 | 12.7 × 12.7 × 5.0 cm，0.67 kg |
+| 電源 | 規格頁標示最大連續功率 155W（機型上限；跑本項目的 decode 負載遠低於此，實測整機約 30~40W） |
+| 價格 | **¥8,999**（Apple 中國官網，32GB + 512GB 這一配置，2026-11 查價） |
+
+### 同系列對照（決定了「能用什麼互聯手段」）
+
+| 機型 | 芯片 / 內存 | 帶寬 | 雷電 | 能不能做 RDMA |
+|---|---|---|---|---|
+| Mac mini M4 32GB/512GB | M4 10 核 CPU / 10 核 GPU，32GB | 120 GB/s | 3 × TB4（40Gb/s） | **不能**（RDMA 要 TB5 + macOS 26.2） |
+| Mac mini M4 Pro | 12 或 14 核 CPU、16 或 20 核 GPU，24~64GB | 273 GB/s | 3 × **TB5（120Gb/s）** | 可以 |
+| Mac Studio M3 Ultra 512GB | M3 Ultra（28 或 32 核 CPU、60 或 80 核 GPU），512GB | 819 GB/s | TB5 | 可以 |
+| 本項目實際的開發機 | MacBook Air **M1，16GB** | 68 GB/s | 2 × TB3／USB4 | 不能（而且只有一台，所以多台測試是用 loopback 模擬的） |
+
+兩個直接後果，寫在硬體裡而不是寫在「限制」裡：
+
+1. **基礎版 M4 mini 只有 TB4，沒有 RDMA**。所以本項目的傳輸是 TCP over TB4，
+   每一次 hop 都付協議棧成本（實測 0.071ms，原始 3.1ms）。要 RDMA 就得換 M4 Pro / M5。
+2. **16 台 32GB 的「512GB」是標稱值，實際可用只有 16 × 24 = 384GB**（每台扣系統 + Metal 約 8GB）。
+   要真正打平一台 512GB Studio 的可用容量（約 480GB），需要 **20 台**。
+   這也是為什麼下面那張表用「每台 24GB」算，而不是拿標稱 32GB 乘台數。
+
+補一條容易漏的：**每台 512GB 的 SSD 也是分片約束**——4-bit 的 120B 權重約 60GB，
+4 台各放 15GB 沒問題；但 planner 目前只核算 RAM，還沒把磁盤容量算進去（見「已知限制」）。
+
 ## 幾台？速度大概多少
 
 ### 一、最少幾台：由「裝不裝得下」決定，不是由速度決定
 
-前提：**一台 32GB 的 Mac mini 實際只有約 24GB 給模型**（系統 + Metal 保留約 8GB）。
+前提：**一台 M4 / 32GB / 512GB 的 Mac mini，實際只有約 24GB 給模型**（系統 + Metal 保留約 8GB）。
 表裡的數字是單台最重那份的佔用（含該台要背的權重 + KV，node 0 額外背 embed + lm_head），
 由 `python -m cluster.capacity --ctx 32768` 算出來的。
 
@@ -159,6 +196,8 @@ PYTHONPATH=. .venv-arm/bin/python bench/serve_fault.py --mode spec --tokens 96 -
 - k 仍受文字類型限制；自由散文的單人加速只有 1.0~1.3×。要更高需要**真的同 tokenizer 的小模型**
   或訓練過的 draft head（early-exit 實測 k=0，不可用）。
 - 沒有前綴快取 / 對話續聊：每個批次都從零 prefill。
+- **planner 只核算 RAM，沒核算每台 SSD 的容量**：4-bit 的 120B 約 60GB 分給 4 台（各 15GB）
+  在 512GB 機器上很寬鬆；但 200B 級 + 多模型共存時，磁盤也會變成硬約束。
 - serve 沒有背壓、優先級、超時；只有 `max_batch`、窗口、`--mode` 三個旋鈕。
 - 中轉鏈路只有 token 認證，沒有傳輸加密。
 - **從未在真 TB4 上跑過**：`--peers`/`--advertise` 的語意在同機兩進程驗過，雲 VM 不可達（本機代理吃連線）。
