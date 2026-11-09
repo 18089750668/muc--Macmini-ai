@@ -1,0 +1,10 @@
+# 權重檔（956MB，不放進 repo）
+models/
+# 本地虛擬環境
+.venv/
+.venv-arm/
+# python / macOS 雜物
+__pycache__/
+*.pyc
+.DS_Store
+*.log

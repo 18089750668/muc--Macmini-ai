@@ -1,0 +1,12 @@
+{
+  "tau_ms_per_layer": 0.1846,
+  "stage_fixed_ms": 0.6199,
+  "n_layers": 8,
+  "decode": "fastmodel",
+  "samples": {
+    "1": 0.8045,
+    "2": 1.1989,
+    "4": 1.5497,
+    "8": 2.0964
+  }
+}
