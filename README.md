@@ -108,7 +108,6 @@ PYTHONPATH=. .venv-arm/bin/python bench/serve_fault.py --mode spec --tokens 96 -
 | Mac mini M4 32GB/512GB | M4 10 核 CPU / 10 核 GPU，32GB | 120 GB/s | 3 × TB4（40Gb/s） | **不能**（RDMA 要 TB5 + macOS 26.2） |
 | Mac mini M4 Pro | 12 或 14 核 CPU、16 或 20 核 GPU，24~64GB | 273 GB/s | 3 × **TB5（120Gb/s）** | 可以 |
 | Mac Studio M3 Ultra 512GB | M3 Ultra（28 或 32 核 CPU、60 或 80 核 GPU），512GB | 819 GB/s | TB5 | 可以 |
-| 本項目實際的開發機 | MacBook Air **M1，16GB** | 68 GB/s | 2 × TB3／USB4 | 不能（而且只有一台，所以多台測試是用 loopback 模擬的） |
 
 兩個直接後果，寫在硬體裡而不是寫在「限制」裡：
 
