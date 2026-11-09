@@ -45,7 +45,7 @@ cluster/
   capacity.py      容量階梯（32GB→24GB 可用、頭尾 embedding 的兩份成本）
   moe.py           EP vs pipeline 的兩筆通訊稅成本模型
   econ.py          容量 / 速度 / 錢三欄
-  topology.py      多台怎麼連：M4 mini 3 個 TB4 口、環 vs 全互聯、端口區段約定
+  topology.py      多台怎麼連：鏈（n 台 = n−1 條線）、環 / 全互聯的物理上限、端口區段
   remote.py        gateway / publish / consume / plist / newtoken
   heartbeat 相關   coordinator.deadline_ms / ping、stage 的轉發式心跳
 bench/
@@ -53,6 +53,7 @@ bench/
   real_model.py batch_decode.py serve_load.py serve_fault.py spec_k.py
   heartbeat_test.py fault_test.py fault_recover.py
   verify_capacity.py cross_machine_rtt.py                             # 容量驗證 / 跨機（未驗）
+  chain_topology.py                                                   # 鏈 vs 直連回報
 ```
 
 ## 跑起來
@@ -75,6 +76,17 @@ PYTHONPATH=. .venv-arm/bin/python bench/serve_load.py --nodes 2 --clients 1 2 4
 # 投機解碼：量 k（先比逐 token 一致，再看速度）
 PYTHONPATH=. .venv-arm/bin/python bench/spec_k.py --nodes 4 --tokens 48 --block 8 \
   --stage-port 7641 --head-port 7681
+
+# 4 台鏈（實體就是鏈：4 台 3 條線，每台只接上下家；--chain 是預設）
+PYTHONPATH=. .venv-arm/bin/python -m cluster.main run --nodes 4 \
+  --stage-port 7101 --head-port 0 --prompt-len 512 --max-tokens 32 --objective max
+
+# 拓撲驗證：鏈式回程 vs 尾巴直連 head，逐 token 必須一致
+PYTHONPATH=. .venv-arm/bin/python bench/chain_topology.py --nodes 2 3 4 \
+  --stage-port 10301 --prompt-len 512 --tokens 32
+
+# 每台實際要跑什麼指令（含 --ret-port 回程口、端口區段怎麼錯開）
+PYTHONPATH=. .venv-arm/bin/python -m cluster.topology --nodes 4
 
 # 掉線 → 重建 → 重放 → 續跑（服務層）
 PYTHONPATH=. .venv-arm/bin/python bench/serve_fault.py --mode spec --tokens 96 --after 2.5
@@ -142,8 +154,15 @@ PYTHONPATH=. .venv-arm/bin/python bench/serve_fault.py --mode spec --tokens 96 -
 
 ### 二、最多幾台
 
-- **全互聯上限 4 台**：Mac mini M4 只有 3 個 TB4 口，任意兩台直連需要每台 n−1 條線；超過 4 台就不可能全互聯。
-- **環形（ring）可以到 16 台**：每台只需 2 條線（上下游各一），16 台 ≈ ¥14.4 萬、滿載約 800W。
+- **實際佈線是「鏈」，不是環、也不是全互聯**：每台只接上下家，**n 台就是 n−1 條線**
+  （4 台 3 條、16 台 15 條）。端點只佔 1 個 TB4 口，中間每台佔 2 個，剩下 1 個留給
+  電源/管理/外設。這是唯一「不用多拉線」的接法。
+- **鏈的代價在回程**：最後一台沒有直達 head 的路，結果要一級一級往上傳，所以每台多開
+  一個回程口（`--ret-port`）。`--chain` 是**預設**；只有你真的願意在尾巴和 head 之間
+  多拉一條線（成環）時，才用 `--no-chain` 走「尾巴直連 head」。
+- **全互聯上限 4 台**：Mac mini M4 只有 3 個 TB4 口，任意兩台直連需要每台 n−1 條線；
+  超過 4 台就不可能全互聯（4 台剛好 6 條線、每台 3 個口全占滿，沒有餘量）。
+- **鏈可以到 16 台**（15 條線、中間每台 2 個口），16 台 ≈ ¥14.4 萬、滿載約 800W。
 - **實測只到 8 節點**（1 層×8 的極端不均切分，正確性通過，hash `3e6516f959cff6a4`）。
   **16 台是物理可行、但本項目沒有實測過的**。
 - 注意：**台數變多不會讓 greedy 變快**。接力模式下總時間 ≈ Σ(各段) + (n−1)×hop，
@@ -163,8 +182,15 @@ PYTHONPATH=. .venv-arm/bin/python bench/serve_fault.py --mode spec --tokens 96 -
 | 2 | 玩具 8 層 | greedy | 123.6 tok/s |
 | 3 | 玩具 8 層 | greedy | 116.2 tok/s |
 | 4 | 玩具 8 層 | greedy | 91.5 tok/s |
+| 2 | 玩具 8 層 | 直連回報 / 鏈式回程 | 178.6 / 148.2 tok/s（同 512 prompt、32 token） |
+| 3 | 玩具 8 層 | 直連回報 / 鏈式回程 | 139.1 / 138.9 tok/s |
+| 4 | 玩具 8 層 | 直連回報 / 鏈式回程 | 123.7 / 114.9 tok/s；CLI 鏈式 **112.7 tok/s** |
 
-最後四行是**反面教材**：玩具模型一台就裝得下，所以「1 台」那一行存在，而且是**最快**的。
+倒數三行是**拓撲驗證**：同一顆模型、同一組切分，「尾巴直連 head」與「鏈式逐級回程」
+逐 token 完全一致；鏈式只多付一次回程轉發，實測 2~4 台落在 0.83~1.01 倍之間
+（數字抖動主要來自 loopback 與 hop 量測，不是拓撲本身）。
+
+「玩具 8 層 1/2/3/4 台」那四行是**反面教材**：玩具模型一台就裝得下，所以「1 台」那一行存在，而且是**最快**的。
 真模型（裝不下）才是這個項目的前提——那時 1 台根本不存在。
 
 ### 四、估算速度（成本模型，未實測，假設 k=3）

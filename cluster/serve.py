@@ -359,7 +359,8 @@ def main():
         srv.bind(("127.0.0.1", args.head_port))
         srv.listen(1)
         chain = Chain(cfg, bounds, [args.stage_port + i for i in range(args.nodes - 1)],
-                      args.head_port, 0, srv, model_dir=args.model_dir)
+                      args.head_port, 0, srv, model_dir=args.model_dir,
+                      chain=getattr(args, "chain", True))
         chain.start()
         head = RingHead(cfg, bounds[0][0], bounds[0][1], chain.out_sock,
                         chain.in_sock, model_dir=args.model_dir)

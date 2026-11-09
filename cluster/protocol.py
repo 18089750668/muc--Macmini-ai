@@ -138,10 +138,21 @@ _readers = {}
 
 
 def _reader(sock):
+    # 快取按 id(sock) 存。id 只有在舊物件被回收之後才會重用，而快取本身
+    # 握著舊 socket 的強引用、舊物件又永遠不會回收 —— 兩者湊在一起就是
+    # 「同一個 id 指到兩個不同的 socket」。一旦撞上，讀到的就是上一輪
+    # 殘留的字節（形狀合法、內容錯、不報錯）。所以這裡除了 id 還要比物件本身。
     r = _readers.get(id(sock))
+    if r is not None and r.sock is not sock:
+        r = None
     if r is None:
         r = _readers[id(sock)] = _Reader(sock)
     return r
+
+
+def forget(sock):
+    """socket 關掉之後把它的讀取緩衝丟掉（含 slab 裡沒讀完的殘留字節）。"""
+    _readers.pop(id(sock), None)
 
 
 _SCALAR_KEYS = ("req", "chunk_id", "start_pos", "n_in", "tau_ms")

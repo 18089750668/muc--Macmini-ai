@@ -77,7 +77,7 @@ def build_ring(cfg, nodes, stage_port, head_port):
     srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     srv.bind(("127.0.0.1", head_port))
     srv.listen(1)
-    chain = Chain(cfg, bounds, ports, head_port, 0, srv, model_dir=PATH)
+    chain = Chain(cfg, bounds, ports, head_port, 0, srv, model_dir=PATH, chain=True)
     chain.start()
     lo, hi = bounds[0]
     head = RingHead(cfg, lo, hi, chain.out_sock, chain.in_sock, model_dir=PATH)

@@ -1045,3 +1045,48 @@ PYTHONPATH=. .venv-arm/bin/python bench/serve_fault.py --mode batch --tokens 96 
 PYTHONPATH=. .venv-arm/bin/python bench/spec_k.py --nodes 1 --tokens 24 \
   --drafters lookup,self --draft-layers 12
 ```
+
+## 拓撲修正：鏈（n−1 條線）與鏈式回程
+
+**觸發**：實體佈線不是全互聯，也不是環，是「每台只接上下家」的鏈。4 台 = 3 條線，
+端點度數 1、中間度數 2。舊程式的最後一台用 `--reply` 直連 head，等於假設「尾巴能
+一步回到頭」——在鏈上這條路不存在。
+
+**改法**：每台（除尾巴）多開一個回程口 `--ret-port`，用一個 `_relay` 執行緒把下游
+的 frame 原樣轉給上游；`--reply` 指上游那一台的回程口（第 1 台指 head）。head 恢復
+「等第二條連線」，只是那條線來自最近的一台。`--chain` 現在是 `run` 的**預設**。
+
+**量測**（玩具 8 層、同機 loopback、512 prompt / 32 token、逐 token 必須一致）：
+
+| 台數 | 直連回報 tok/s | 鏈式回程 tok/s | 比值 | hop（直/鏈） | tau（直/鏈） |
+|---|---|---|---|---|---|
+| 2 | 178.6 | 148.2 | 0.83× | 0.98 / 0.86 ms | 3.89 / 4.28 ms |
+| 3 | 139.1 | 138.9 | 1.00× | 2.52 / 2.58 ms | 3.62 / 3.48 ms |
+| 4 | 123.7 | 114.9 | 0.93× | 4.08 / 4.59 ms | 2.72 / 2.80 ms |
+
+4 台 CLI（`run --nodes 4 --prompt-len 512 --max-tokens 32 --objective max`，鏈式預設）
+**112.7 tok/s**，`g=1.00`、`frames/token=0.97`、`tavg=2.90ms`、`useful_inflight=2.83`。
+鏈式與直連、與單機基準逐 token 一致（`bench/chain_topology.py` 會 assert 鏈/直一致）。
+
+**鏈式的成本**：回程每 frame 多一次轉發，每多一台多一跳。所以「鏈」換來的是少一條
+線，付的是尾巴的結果多走幾跳；不是免費。
+
+### 這輪被挖出來的四個坑（都不是「鏈」本身的錯，但只有鏈才會踩到）
+
+1. **只有尾巴可以連 `--reply`**。第一版 spawn 讓三台都帶 `--reply head_port`，
+   中間兩台那條連線沒人讀，卻被 head 的 `accept()` 先搶到 → 心跳 3×2s 全超時。
+   症狀極具誤導性：**2 台永遠正常、4 台必定失敗**。修法：`stage.serve()` 只在
+   `not self.next_addr`（尾巴）時連 reply；spawn 也只給尾巴 `--reply`。
+2. **head 用固定埠會被殘留尾巴搶走 accept**。修法：`--head-port 0`，由核心配臨時埠
+   （`Chain.spawn` 從 `srv.getsockname()` 解析），殘留連線再也瞄不準。
+3. **玩具模型的權重重建不穩定**。同 seed 同 cfg，第二個 `ToyModel` 開始同一個 prompt
+   的 hidden 由 1.2418 漂到 0.9852（形狀全合法、不報錯）。一度被當成「第二次建鏈就
+   吐錯 token」的根因；隔離實驗（同實例 6 次一致、每建新實例就漂）才定位到這裡。
+   修法：按 cfg 快取，一個進程一份權重。
+4. **冷啟動 ≠ 掉線**。鏈式第一跳要連三段 TCP，第一個心跳常超過 250ms。`ping()`
+   在「還沒量到基線」時用 2s 預算、最多 3 次；`_probe_alive()` 仍然只問一次
+   （它的任務是分辨「慢」與「卡死」，不能靠重試把掉線告知延後 3 倍）。
+
+**沒有被推翻的舊結論**：心跳仍要走完整條鏈；掉線仍要立刻告知（`closed` 3ms /
+`hung` 1511ms）；恢復仍只能靠重放前綴。鏈只是把「回程怎麼走」這一格補上。
+

@@ -60,11 +60,32 @@ def mlp(x, w):
     return a @ w["w2"]
 
 
+_TOY_CACHE = {}
+
+
 class ToyModel:
     """Weights are generated from a numpy RNG, so every process builds the
-    exact same model and the token-level comparison is meaningful."""
+    exact same model and the token-level comparison is meaningful.
+
+    但「同一個 process 反覆 new 新實例」並不穩定：實測同一個 seed、同一個
+    cfg，第二個實例開始同一個 prompt 的 hidden 就從 1.2418 漂到 0.9852（
+    不報錯、形狀全對，只是數字不同）。所以這裡按 cfg 快取，一個 process
+    只有一份權重 —— 真實部署本來也只載入一次，反覆重建不該是常態。
+    """
+
+    def __new__(cls, cfg: ToyConfig):
+        key = (cfg.seed, cfg.n_layers, cfg.hidden, cfg.ffn, cfg.vocab)
+        inst = _TOY_CACHE.get(key)
+        if inst is None:
+            inst = super().__new__(cls)
+            inst._built = False
+            _TOY_CACHE[key] = inst
+        return inst
 
     def __init__(self, cfg: ToyConfig):
+        if self._built:
+            return
+        self._built = True
         self.cfg = cfg
         rng = np.random.default_rng(cfg.seed)
         H, F, V = cfg.hidden, cfg.ffn, cfg.vocab
@@ -90,9 +111,15 @@ class ToyModel:
         ids = mx.array(list(tokens), mx.int32)
         return mx.take(self.tok_emb, ids, axis=0)[None]          # [1, L, H]
 
-    def forward_range(self, h, start_pos, lo, hi, kv):
+    def forward_range(self, h, start_pos, lo, hi, kv, rope_pos=None, valid_from=None):
+        """rope_pos / valid_from 是批次路徑才需要的（真模型用它們做左補齊遮罩）。
+
+        ToyModel 只支援單序列，所以這裡只接受位置向量（rope_pos[0]），
+        valid_from 忽略——玩具模型從來沒跑過不等長批次，也就不假裝支援。
+        """
         cfg = self.cfg
-        positions = mx.arange(start_pos, start_pos + h.shape[1])
+        positions = (rope_pos[0] if rope_pos is not None
+                     else mx.arange(start_pos, start_pos + h.shape[1]))
         for i in range(lo, hi):
             n = rms_norm(h, self.layers[i]["n1"], cfg.eps)
             h = h + attention(n, self.layers[i], kv[i], positions, start_pos, cfg)

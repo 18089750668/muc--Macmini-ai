@@ -18,7 +18,7 @@ DEBUG = os.environ.get("CLUSTER_DEBUG", "") not in ("", "0")
 class StageServer:
     def __init__(self, cfg: ToyConfig, lo: int, hi: int, port: int,
                  next_addr=None, reply_to=None, fast=False, ctx_len=640,
-                 persist=False, model_dir=None):
+                 persist=False, model_dir=None, chain=False, ret_port=None):
         # 真模型：這台只載入自己那幾層。第一段額外揹 embedding，最後一段額外
         # 揹 final norm + 輸出矩陣（tie 的時候那就是 embedding 本身，切不開）。
         self.real_dir = model_dir
@@ -29,6 +29,14 @@ class StageServer:
         self.port = port
         self.next_addr = next_addr
         self.reply_to = reply_to
+        # 鏈式佈線（4 台 = 3 條線）下，最後一台回不到 head：TB4 每條線都是
+        # 獨立的點對點 L2，沒有跨跳路由。所以回程不是「尾巴直接連 head」，
+        # 而是每台各開一個回程口 ret_port：下游把最終 RESULT 送到這裡，
+        # 這裡原樣轉給自己上游的回程口，最前一級轉給 head 的 head_port。
+        # 用獨立連線而不是同一條 socket 雙向收發：實測同一條 socket 兩邊
+        # 同時讀寫會在第二次重建時靜默吐錯 token（不 crash、形狀全對）。
+        self.ret_port = ret_port
+        self.chain = chain
         self.fast = FastModel(cfg, ctx_len) if fast else None
         if model_dir:
             self.model = RealModel(model_dir, lo=lo, hi=hi,
@@ -87,6 +95,10 @@ class StageServer:
         srv.bind(("127.0.0.1", self.port))
         srv.listen(1)
         print(f"[stage] layers[{self.lo}:{self.hi}] listening :{self.port}", flush=True)
+        if self.ret_port:
+            import threading
+            t = threading.Thread(target=self._relay, daemon=True)
+            t.start()
 
         # 一個 stage 可能活很久（家用機器開機就常駐），上游卻會斷：筆記本闔蓋、
         # 換 Wi-Fi、head 重啟。所以這裡不是「上游斷了就自殺」，而是回到 accept
@@ -101,7 +113,17 @@ class StageServer:
             else:
                 self.kv = new_kv(self.cfg.n_layers)
             out = P.connect(*self.next_addr, retries=200) if self.next_addr else None
-            reply = P.connect(*self.reply_to, retries=200) if self.reply_to else None
+            if self.ret_port:
+                # 這一台只負責「算自己那幾層 + 把下游的回程轉上去」，
+                # 它的回程連線由 _relay 執行緒持有，主迴圈不碰。
+                reply = None
+            else:
+                # 回程連線只有「尾巴」需要：中間那幾台的結果是往 `--next`
+                # 那條連線送下去的，自己再連一條回程只會在上一台/head 的
+                # accept 佇列裡排一條永遠沒人讀的空連線（實測會讓心跳全超時）。
+                reply = (P.connect(*self.reply_to, retries=200)
+                         if (self.reply_to and not self.next_addr) else None)
+
             aborted = False
             try:
                 aborted = self._loop(conn, out, reply)
@@ -119,16 +141,51 @@ class StageServer:
                 for sock in (conn, out, reply):
                     if sock is not None:
                         try:
+                            P.forget(sock)
                             sock.close()
                         except OSError:
                             pass
             if aborted and not self.persist:
                 return
 
+    def _relay(self):
+        """回程口：收下游送回來的最終結果，原樣轉給上游（最前一級轉給 head）。"""
+        import socket
+        srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        srv.bind(("0.0.0.0", self.ret_port))
+        srv.listen(4)
+        print(f"[stage {self.lo}:{self.hi}] 回程口 listening :{self.ret_port} "
+              f"-> {self.reply_to[0]}:{self.reply_to[1]}", flush=True)
+        while True:
+            down, _ = srv.accept()
+            P.tune(down)
+            back = P.connect(*self.reply_to, retries=400)
+            try:
+                while True:
+                    t, m, a = P.recv_frame(down)
+                    P.send_frame(back, t, dict(m), a)
+            except (ConnectionError, OSError, socket.timeout):
+                # 下游斷了（掉線/重建）：這台自己會由上層的 deadline 判掉，
+                # 回程口繼續等下一次連線。
+                pass
+            finally:
+                P.forget(down)
+                try:
+                    down.close()
+                except OSError:
+                    pass
+                try:
+                    back.close()
+                except OSError:
+                    pass
+
     def _loop(self, conn, out, reply):
         while True:
             P.arm(conn)
             ftype, meta, arr = P.recv_frame(conn)
+            if os.environ.get("CLUSTER_TRACE"):
+                print(f"[stage {self.lo}:{self.hi}] <- {ftype} {meta}", flush=True)
             if ftype == P.ABORT:
                 print("[stage] abort", flush=True)
                 if out is not None:
@@ -150,6 +207,9 @@ class StageServer:
                 # 頭在 in_sock 上等，所以心跳必須整條鏈走完一圈才算數 --
                 # 順便量到的就是整條鏈的往返，不是某一跳。
                 down = out if out is not None else reply
+                if os.environ.get("CLUSTER_TRACE"):
+                    print(f"[stage {self.lo}:{self.hi}] hb -> "
+                          f"{'out' if out is not None else 'reply'}", flush=True)
                 P.send_frame(down, P.HEARTBEAT, dict(meta or {}), None)
                 continue
             if ftype not in (P.PREFILL, P.VERIFY):
@@ -173,6 +233,10 @@ class StageServer:
                 if DEBUG:
                     print(f"[stage {self.lo}:{self.hi}] in{arr.shape} out{out_h.shape} "
                           f"logits{lg.shape} toks{len(toks)}", flush=True)
+                if os.environ.get("CLUSTER_TRACE_FILE"):
+                    with open(os.environ["CLUSTER_TRACE_FILE"], "a") as f:
+                        f.write(f"{os.getpid()} sp={meta['start_pos']} "
+                                f"in0={float(np.array(arr).ravel()[0]):.4f} toks={toks[:2]}\n")
                 P.send_frame(reply, P.RESULT, {
                     "req": meta.get("req", 0),
                     "chunk_id": meta.get("chunk_id", 0),

@@ -122,6 +122,11 @@ class RingHead:
         meta["n_in"] = int(h.shape[1])
         meta["batch"] = int(h.shape[0])
         t1 = time.perf_counter()
+        if os.environ.get("CLUSTER_TRACE_FILE"):
+            import numpy as _n
+            with open(os.environ["CLUSTER_TRACE_FILE"], "a") as f:
+                f.write(f"{os.getpid()} send {kind} sp={meta.get('start_pos')} "
+                        f"h0={float(_n.array(h).ravel()[0]):.4f}\n")
         try:
             P.send_frame(self.out_sock, kind, meta, np.array(h))
         except OSError as exc:
@@ -226,43 +231,63 @@ class RingHead:
             return self.timeout_s * 1e3
         return max(500.0, min(self.timeout_s * 1e3, 20.0 * self.lat_ms))
 
-    def ping(self, budget=None, raise_on_fail=True):
+    def ping(self, budget=None, raise_on_fail=True, attempts=3):
         """問一次「還在嗎」。開工前先問，比跑到一半才發現鏈路死了便宜得多——
-        遠程鏈路放半小時後是不是還活著，只有問了才知道。"""
-        budget = budget or min(2.0, max(0.25, 4.0 * self.last_rtt_ms / 1e3))
-        t0 = time.perf_counter()
-        self.chunk_id += 1
-        cid = self.chunk_id
-        try:
-            self.in_sock.settimeout(budget)
-            P.send_frame(self.out_sock, P.HEARTBEAT, {"chunk_id": cid}, None)
-            P.arm(self.in_sock)
-            while True:
-                ftype, meta, _ = P.recv_frame(self.in_sock)
-                if ftype == P.HEARTBEAT and meta.get("chunk_id") == cid:
+        遠程鏈路放半小時後是不是還活著，只有問了才知道。
+
+        `attempts` 不是「寬容掉線」，而是為了分辨「真死」和「剛建好還沒轉起來」：
+        第一跳的 stage 要 accept、再往下一跳連、再往上游連回程口，這三段都是
+        TCP 握手，剛重建完的那一瞬間很容易超過一個短 timeout。真死的判定靠的是
+        attempts 全部失敗 + 後面「卡住還是慢」的二次確認，不是靠一次超時。"""
+        # 冷啟動（還沒量到基線）不能用 250ms 判死刑。有基線之後收緊到 4×RTT。
+        if budget is None:
+            budget = (2.0 if self.last_rtt_ms <= 0
+                      else min(2.0, max(0.25, 4.0 * self.last_rtt_ms / 1e3)))
+        last = None
+        for k in range(max(1, attempts)):
+            t0 = time.perf_counter()
+            self.chunk_id += 1
+            cid = self.chunk_id
+            try:
+                self.in_sock.settimeout(budget)
+                P.send_frame(self.out_sock, P.HEARTBEAT, {"chunk_id": cid}, None)
+                if os.environ.get("CLUSTER_TRACE"):
+                    print(f"[host] hb sent cid={cid} try={k}", flush=True)
+                P.arm(self.in_sock)
+                while True:
+                    ftype, meta, _ = P.recv_frame(self.in_sock)
+                    if os.environ.get("CLUSTER_TRACE"):
+                        print(f"[host] hb recv {ftype} {meta}", flush=True)
+                    if ftype == P.HEARTBEAT and meta.get("chunk_id") == cid:
+                        self.last_rtt_ms = (time.perf_counter() - t0) * 1e3
+                        self.pings += 1
+                        return self.last_rtt_ms
+                    # 遲到的 RESULT：他其實活著，只是慢了；不吞掉結論，只記活著
                     self.last_rtt_ms = (time.perf_counter() - t0) * 1e3
                     self.pings += 1
                     return self.last_rtt_ms
-                # 遲到的 RESULT：他其實活著，只是慢了；不吞掉結論，只記活著
-                self.last_rtt_ms = (time.perf_counter() - t0) * 1e3
-                self.pings += 1
-                return self.last_rtt_ms
-        except socket.timeout as exc:
-            if not raise_on_fail:
-                return None
-            raise StageLost(
-                f"no heartbeat answer within {budget:.2f}s: the link is open but "
-                f"the stage is not responding (baseline round {self.lat_ms:.1f}ms)",
-                "timeout") from exc
-        except OSError as exc:
-            if not raise_on_fail:
-                return None
+            except socket.timeout as exc:
+                last = ("timeout", exc)
+                continue
+            except OSError as exc:
+                last = ("closed", exc)
+                break                      # 連線本身就壞了，重試沒有意義
+        if not raise_on_fail:
+            return None
+        kind, exc = last if last else ("timeout", None)
+        if kind == "closed":
             raise StageLost(f"heartbeat failed: {exc}", "closed") from exc
+        raise StageLost(
+            f"no heartbeat answer after {max(1, attempts)} tries "
+            f"({budget:.2f}s each): the link is open but the stage is not "
+            f"responding (baseline round {self.lat_ms:.1f}ms)", "timeout") from exc
 
     def _probe_alive(self, budget=1.0):
         """硬門檻到了之後再問一句：是慢，還是卡死。"""
         self.last_rtt_ms = 0.0          # 一定要清零，否則會拿舊的回應當現在的
-        self.ping(budget=budget, raise_on_fail=False)
+        # 這裡只問一次：已經錯過硬門檻了，目的是「分清楚是慢還是卡死」，
+        # 不是再給它一次機會。重試會讓「掉線告知」延後 3 倍，正是要避免的事。
+        self.ping(budget=budget, raise_on_fail=False, attempts=1)
         return self.last_rtt_ms > 0, ""
 
     def crop(self, length):
