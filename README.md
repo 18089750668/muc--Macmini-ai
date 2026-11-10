@@ -1,17 +1,5 @@
 # 多台 Mac mini 聯合跑本地大模型（最小原型）
 
-<p align="center">
-  <b>覺得代碼 OK 的，可以隨便打賞一點，多少都行。</b>
-</p>
-
-<p align="center">
-  <img src="assets/reward-wechat.jpg" width="230" alt="微信支付">
-  &nbsp;&nbsp;&nbsp;&nbsp;
-  <img src="assets/reward-alipay.jpg" width="230" alt="支付寶">
-</p>
-
-<p align="center"><sub>微信支付（左） / 支付寶（右）</sub></p>
-
 用 N 台普通 Mac（32GB、TB4 互連）跑一個**單機裝不下**的本地大模型。這不是「把模型切開放到別台」的演示，
 而是一個可量測的原型：協議、分片、投機解碼、批次服務、掉線恢復，每一項都有實測數字與正確性基準。
 
@@ -247,3 +235,17 @@ PYTHONPATH=. .venv-arm/bin/python bench/serve_fault.py --mode spec --tokens 96 -
 ### 徵求真機測試
 
 如果有條件的可以移動到多台Mac mini上測試，測試結果反饋給我，然後我進行代碼修改。
+
+---
+
+<p align="center">
+  <b>覺得代碼 OK 的，可以隨便打賞一點，多少都行。</b>
+</p>
+
+<p align="center">
+  <img src="assets/reward-wechat.jpg" width="220" alt="微信支付">
+  &nbsp;&nbsp;&nbsp;&nbsp;
+  <img src="assets/reward-alipay.jpg" width="220" alt="支付寶">
+</p>
+
+<p align="center"><sub>微信支付（左） / 支付寶（右）</sub></p>
